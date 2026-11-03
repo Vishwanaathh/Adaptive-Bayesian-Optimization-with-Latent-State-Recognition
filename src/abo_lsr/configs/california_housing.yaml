@@ -1,0 +1,32 @@
+# Real-data regression experiment. Loads scikit-learn California Housing. If the
+# default Figshare download returns 403, a checksum-verified S3 mirror is tried.
+# The fallback dataset is cached in scikit-learn's data home directory.
+seeds: [17, 23, 41, 59, 71]
+families: [ridge, lasso, elasticnet]
+methods:
+  - random
+  - gp_ucb
+  - gp_ei
+  - scheduled_ucb
+  - gp_hedge
+  - abo_lsr_hard
+  - abo_lsr_soft
+  - abo_no_hmm
+  - abo_fixed_hmm
+budget: 24
+initial_points: 6
+test_size: 0.20
+validation_size: 0.20
+candidate_pool: 1024
+gp_restarts: 1
+hedge_eta: 0.5
+hmm_warmup: 8
+hmm_em_every: 3
+hmm_em_iterations: 15
+hmm_init:
+  means: [0.0, 0.0, 0.0]
+  stds: [1.8, 0.8, 0.35]
+  sticky_prior: 8.0
+  transition_prior: 1.0
+  min_variance: 0.10
+output_dir: results/california_housing
