@@ -1,5 +1,149 @@
 # ABO-LSR: Adaptive Bayesian Optimization with Latent State Recognition
 
+A small Bayesian-optimization library for expensive, low-dimensional problems such as hyperparameter
+tuning. A Gaussian process proposes points; a three-state Gaussian HMM watches how surprising each result
+was and shifts the search between exploring, exploiting and refining. It also ships the experiment code
+for the accompanying research study (tuning Ridge, Lasso and ElasticNet on California Housing).
+
+Needs only `numpy` and `scipy` for the optimizer. Python 3.10+.
+
+## Install
+
+```bash
+pip install abo-lsr                  # optimizer only (numpy, scipy)
+pip install "abo-lsr[experiments]"   # + California Housing runner, CLI, plotting
+```
+
+From a checkout instead: `pip install .` (or `pip install ".[experiments]"`).
+
+## Quick start
+
+```python
+from abo_lsr import BayesianOptimizer, Dimension, SearchSpace
+
+# 1. Describe what to search over
+space = SearchSpace([
+    Dimension("alpha", "log", 1e-4, 1e1),
+    Dimension("l1_ratio", "continuous", 0.05, 1.0),
+])
+
+# 2. Write a function that returns a score to MAXIMIZE
+from sklearn.datasets import load_diabetes
+from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = load_diabetes(return_X_y=True)
+
+def objective(params):
+    model = make_pipeline(StandardScaler(),
+                          ElasticNet(alpha=params["alpha"], l1_ratio=params["l1_ratio"], max_iter=20000))
+    return cross_val_score(model, X, y, cv=5, scoring="r2").mean()
+
+# 3. Run
+opt = BayesianOptimizer(space, objective, {"seed": 0})
+result = opt.run(budget=20, initial_points=6)
+print(result["best_score"], result["best_params"])
+```
+
+(`scikit-learn` is used here only to make the objective; the optimizer itself does not need it.)
+A runnable version without scikit-learn is in `examples/quickstart.py`.
+
+**Rules**
+- The optimizer **maximizes**. To minimize a loss, return `-loss`.
+- `budget` is the total number of objective calls, including the `initial_points` random ones.
+- `params` arrives as a dict with the names and types you declared.
+- Tune on training or validation data only; keep your final test set out of the objective.
+
+## Usage guide
+
+### Dimension types
+
+| Kind | Example |
+|---|---|
+| `continuous` | `Dimension("x", "continuous", 0.0, 1.0)` |
+| `log` | `Dimension("lr", "log", 1e-4, 1e-1)` (low must be > 0) |
+| `integer` | `Dimension("max_depth", "integer", 1, 4)` |
+| `categorical` | `Dimension("loss", "categorical", choices=("squared_error", "huber"))` |
+
+Integer and categorical values reach your objective as `int` and `str`.
+
+### What you get back
+
+- `result`: dict with `best_score`, `best_params`, `best_x`, `evaluations`, `successful_evaluations`,
+  `failed_evaluations`, `elapsed_seconds`, `hmm`, `run_id`.
+- `opt.records`: one dict per evaluation with `step`, `score`, `status`, `z`, `policy`, `belief`,
+  `elapsed`, `params`. `z` is how surprising the score was versus the GP's prediction; `belief` is the
+  HMM's probability over [explore, exploit, refine].
+- `opt.hmm.diagnostics()`: learned transition matrix, state means and stds, log-likelihood.
+
+### Configuration (all keys optional)
+
+```python
+config = {
+    "seed": 0,
+    "optimizer": {
+        "method": "abo_lsr",      # abo_lsr | gp_ucb | gp_ei | scheduled_ucb | gp_hedge | random
+        "controller": "soft",     # soft | hard (abo_lsr only)
+        "candidate_pool": 2048,
+        "gp_restarts": 2,
+    },
+    "hmm": {"enabled": True, "warmup": 8, "em_every": 3, "em_iterations": 20},
+    "acquisition": {"ei_xi": 0.01},
+}
+```
+
+Lower `candidate_pool` and `gp_restarts` for faster runs. To compare against a baseline, rerun with the
+same `seed` and `budget` and `"method": "gp_ei"` or `"random"`. An unknown `method` or `controller`
+raises `ValueError`.
+
+### Saving a run
+
+```python
+BayesianOptimizer(space, objective, config, output_dir="runs/exp1").run(budget=30)
+```
+
+Writes `runs/exp1/summary.json` and `runs/exp1/experiments.sqlite` (one row per evaluation).
+Without `output_dir`, nothing is written to disk.
+
+### Failing objectives
+
+If the objective raises or returns NaN/inf, that call is recorded with a `failed:...` status and uses up
+budget, but is never fed to the GP. The run continues.
+
+### Limits
+
+Best for small, expensive problems (roughly 10-200 evaluations): the exact GP costs O(n^3) in the number
+of evaluations. The HMM states are a modelling hypothesis, not proof of distinct optimization phases; see
+the limitations below and compare against baselines over several seeds.
+
+## Development
+
+```bash
+python -m venv .venv
+# Windows PowerShell:  .venv\Scripts\Activate.ps1
+# macOS/Linux:         source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+## Run the experiment
+
+Requires the `experiments` extra. The default config is bundled with the package:
+
+```bash
+abo-lsr california
+abo-lsr california --config my_config.yaml --output results/my_run
+```
+
+Or without the console script: `python -m abo_lsr.cli california`. A copy of the default config is
+at `src/abo_lsr/configs/california_housing.yaml`.
+
+The first run requires internet access to download California Housing unless it is already cached. If the default Figshare URL returns HTTP 403, the loader tries a checksum-verified S3 mirror. The fallback cache is `abo_lsr_california_housing.npz` inside scikit-learn's data-home directory. For a quick smoke test, make a copy of the YAML and reduce `seeds` to one seed, `budget` to 8, `initial_points` to 4, and `candidate_pool` to 128. Such a smoke test is not a publication-quality experiment.
+
+## Research study
+
 This repository implements a research experiment for adaptive Bayesian optimization driven by a three-state Gaussian HMM. The maintained experiment is **real-data-only** and tunes Ridge, Lasso, and ElasticNet regression on the California Housing dataset distributed by scikit-learn.
 
 ## Method
@@ -27,72 +171,6 @@ The variance ordering is an explicit state-label identification constraint. It d
 - Paired seeds, equal objective evaluation budgets, and common initial designs within each model-family/seed comparison.
 
 `GP-Hedge` uses three experts (UCB, EI, local UCB). It samples an expert from the softmax of cumulative gains, evaluates the selected proposal, refits the GP with the new observation, then updates every expert's gain using the updated posterior mean at that expert's proposal. This is the actual posterior expert-gain update sequence rather than a pre-evaluation prediction shortcut.
-
-## Install
-
-Python 3.10 or newer is required.
-
-```bash
-pip install abo-lsr                  # optimizer only (numpy, scipy)
-pip install "abo-lsr[experiments]"   # + California Housing runner, CLI, plotting
-```
-
-Until it is published to PyPI, install from a checkout: `pip install .` (or `pip install ".[experiments]"`).
-
-For development:
-
-```bash
-python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS/Linux:
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
-```
-
-## Use as a library
-
-```python
-from abo_lsr import BayesianOptimizer, Dimension, SearchSpace
-
-space = SearchSpace([
-    Dimension("alpha", "log", 1e-4, 1e2),
-    Dimension("l1_ratio", "continuous", 0.05, 1.0),
-])
-
-def objective(params):          # the optimizer MAXIMIZES this (e.g. validation R^2)
-    return my_validation_score(**params)
-
-opt = BayesianOptimizer(space, objective, {"seed": 0})
-result = opt.run(budget=30, initial_points=8)
-print(result["best_score"], result["best_params"])
-```
-
-Dimension kinds: `continuous`, `log`, `integer`, `categorical` (with `choices=`).
-Pass `output_dir="runs/exp1"` to also write `summary.json` and an SQLite log of every evaluation;
-by default nothing is written to disk. Failed objective calls (exceptions or non-finite values) use up
-budget and are recorded but never fed to the GP. See `examples/quickstart.py` for a runnable script.
-
-`config` keys (all optional): `seed`; `optimizer.{method, controller, candidate_pool, gp_restarts,
-gp_noise, gp_optimize_every}`; `hmm.{enabled, warmup, em_every, em_iterations, initial_stds, ...}`;
-`acquisition.{ucb_beta, local_radius, ei_xi}`. `optimizer.method` is one of `abo_lsr` (default),
-`gp_ucb`, `gp_ei`, `scheduled_ucb`, `gp_hedge`, `random`; `optimizer.controller` is `soft` or `hard`
-and applies to `abo_lsr`.
-
-## Run the experiment
-
-Requires the `experiments` extra. The default config is bundled with the package:
-
-```bash
-abo-lsr california
-abo-lsr california --config my_config.yaml --output results/my_run
-```
-
-Or without the console script: `python -m abo_lsr.cli california`. A copy of the default config is
-at `src/abo_lsr/configs/california_housing.yaml`.
-
-The first run requires internet access to download California Housing unless it is already cached. If the default Figshare URL returns HTTP 403, the loader tries a checksum-verified S3 mirror. The fallback cache is `abo_lsr_california_housing.npz` inside scikit-learn's data-home directory. For a quick smoke test, make a copy of the YAML and reduce `seeds` to one seed, `budget` to 8, `initial_points` to 4, and `candidate_pool` to 128. Such a smoke test is not a publication-quality experiment.
 
 ## Output files
 
